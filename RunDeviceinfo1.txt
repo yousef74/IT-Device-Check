@@ -1,0 +1,20 @@
+1- Download and unzip the Folder 
+
+2- copy the File "C:\Users\yousef.khaled\Desktop\DeviceDashboard.ps1" Location 
+
+3- Open Windows Powershell in the Folder
+
+4-run the next command 
+
+Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
+
+5- run the next command and insert the file location Between the "++"
+
+& "C:\Users\yousef.khaled\Desktop\Device Info Script\DeviceDashboard.ps1"
+
+IT Will Generate A .HTML File
+
+&
+
+" the file will automatically Open the Result in a web dashboard "
+
