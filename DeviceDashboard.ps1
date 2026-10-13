@@ -8,18 +8,26 @@
 $ErrorActionPreference = "SilentlyContinue"
 
 # ================================================================
-# ADMINISTRATOR CHECK (NON-BLOCKING)
+# ADMINISTRATOR CHECK / AUTO-ELEVATION
 # ================================================================
 
 $CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $Principal = New-Object Security.Principal.WindowsPrincipal($CurrentIdentity)
-$IsAdmin = $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-if (-not $IsAdmin) {
-    Write-Host "Note: Running without Administrator privileges." -ForegroundColor Yellow
-    Write-Host "Some features (KSC connection, license, Secure Boot) may be limited." -ForegroundColor Yellow
-    Write-Host "For full results, right-click and 'Run as administrator'." -ForegroundColor Yellow
+if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "" 
+    Write-Host "Administrator privileges required for full Kaspersky data." -ForegroundColor Yellow
+    Write-Host "Requesting elevation..." -ForegroundColor Yellow
     Write-Host ""
+    $ScriptPath = $PSCommandPath
+    if (-not $ScriptPath) { $ScriptPath = $MyInvocation.MyCommand.Definition }
+    try {
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`"" -Verb RunAs
+    } catch {
+        Write-Host "Unable to request Administrator privileges." -ForegroundColor Red
+        Read-Host "Press ENTER to exit"
+    }
+    exit
 }
 
 # ================================================================
@@ -202,7 +210,16 @@ function Get-DeviceInfo {
 }
 
 function Get-KasperskyInfo {
-    $info = @{}
+    $info = @{
+        ManagedBy = ""
+        LicenseKey = ""
+        LicenseExpiration = ""
+        LicenseDaysRemaining = ""
+        KESInstallVersion = ""
+        LicenseName = ""
+        LicenseActivationDate = ""
+        LicenseSubscriptionStatus = ""
+    }
     $PF64 = ${env:ProgramFiles}
     $PF32 = ${env:ProgramFiles(x86)}
 
@@ -235,6 +252,17 @@ function Get-KasperskyInfo {
         foreach ($p in $commonPaths) { if (Test-Path $p) { $avpPath = $p; break } }
     }
     $info.AvpPath = $avpPath
+
+    # Extract KES install version from path (e.g. "KES.14.1.0")
+    if ($avpPath) {
+        $parentDir = Split-Path $avpPath -Parent
+        $dirName = Split-Path $parentDir -Leaf
+        if ($dirName -match "KES\.(\d+\.\d+\.\d+)") {
+            $info.KESInstallVersion = $Matches[1]
+        } elseif ($dirName -match "KES\.(\d+\.\d+)") {
+            $info.KESInstallVersion = $Matches[1]
+        }
+    }
 
     # KES Version
     $info.KESVersion = "NOT DETECTED"
@@ -296,13 +324,17 @@ function Get-KasperskyInfo {
     $info.KSCConnection = "NOT CONNECTED"
     $info.LastSync = "NOT REPORTED"
     $info.TimeSinceConnection = ""
+    $info.ManagedBy = ""
 
     if ($klnagchkPath -and $info.AgentService) {
         try {
             $output = & $klnagchkPath -sendhb 2>&1 | Out-String
             if ($output) {
                 $m = [regex]::Match($output, "(?im)Administration Server address\s*[:=]\s*(.+)")
-                if ($m.Success) { $info.AdminServer = $m.Groups[1].Value.Trim() }
+                if ($m.Success) {
+                    $info.AdminServer = $m.Groups[1].Value.Trim().Trim("'").Trim('"')
+                    $info.ManagedBy = $info.AdminServer
+                }
                 if ($output -match "(?i)connection.*established|connection.*successful|successfully connected|connection.*OK|connected.*Administration Server") {
                     $info.KSCConnection = "CONNECTED"
                 }
@@ -314,7 +346,15 @@ function Get-KasperskyInfo {
                         if ([DateTime]::TryParse($info.LastSync, [Globalization.CultureInfo]::CurrentCulture, [Globalization.DateTimeStyles]::None, [ref]$parsed)) {
                             $age = (Get-Date) - $parsed
                             if ($age.TotalSeconds -ge 0) {
-                                $info.TimeSinceConnection = "{0:dd\.hh\:mm\:ss}" -f $age
+                                if ($age.TotalDays -ge 1) {
+                                    $info.TimeSinceConnection = "{0} days ago" -f [math]::Floor($age.TotalDays)
+                                } elseif ($age.TotalHours -ge 1) {
+                                    $info.TimeSinceConnection = "{0} hours ago" -f [math]::Floor($age.TotalHours)
+                                } elseif ($age.TotalMinutes -ge 1) {
+                                    $info.TimeSinceConnection = "{0} minutes ago" -f [math]::Floor($age.TotalMinutes)
+                                } else {
+                                    $info.TimeSinceConnection = "just now"
+                                }
                             }
                         }
                     } catch {}
@@ -323,8 +363,52 @@ function Get-KasperskyInfo {
         } catch {}
     }
 
-    # License
+    # License — try avp.com first (needs admin), then fall back to registry
     $info.LicenseStatus = "NOT AVAILABLE LOCALLY"
+    $info.LicenseKey = ""
+    $info.LicenseExpiration = ""
+    $info.LicenseDaysRemaining = ""
+    $info.LicenseName = ""
+    $info.LicenseActivationDate = ""
+    $info.LicenseSubscriptionStatus = ""
+
+    # Registry fallback — reads stored license info even without admin
+    # License key is stored as LicenseInfo\licenseId
+    $licInfoPath = "HKLM:\SOFTWARE\KasperskyLab\LicenseInfo"
+    if (Test-Path $licInfoPath) {
+        $licProps = Get-ItemProperty $licInfoPath -ErrorAction SilentlyContinue
+        if ($licProps) {
+            $licenseId = $licProps.licenseId
+            if ($licenseId) { $info.LicenseKey = $licenseId }
+            # Check for expiration in LicStorage
+            $licStoragePath = "HKLM:\SOFTWARE\KasperskyLab\LicStorage"
+            if (Test-Path $licStoragePath) {
+                $licStorage = Get-ChildItem $licStoragePath -Recurse -ErrorAction SilentlyContinue
+                foreach ($ls in $licStorage) {
+                    $lsProps = Get-ItemProperty $ls.PSPath -ErrorAction SilentlyContinue
+                    if ($lsProps) {
+                        foreach ($prop in $lsProps.PSObject.Properties) {
+                            if ($prop.Name -match "Expir" -and $prop.Value) {
+                                if (-not $info.LicenseExpiration) { $info.LicenseExpiration = $prop.Value.ToString() }
+                            }
+                            if ($prop.Name -match "Key|Id" -and $prop.Value -is [string] -and $prop.Value -match "[A-Z0-9]{5}") {
+                                if (-not $info.LicenseKey) { $info.LicenseKey = $prop.Value }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    # Also check WOW6432Node
+    $licInfoPath32 = "HKLM:\SOFTWARE\WOW6432Node\KasperskyLab\LicenseInfo"
+    if (Test-Path $licInfoPath32) {
+        $licProps32 = Get-ItemProperty $licInfoPath32 -ErrorAction SilentlyContinue
+        if ($licProps32 -and $licProps32.licenseId) {
+            if (-not $info.LicenseKey) { $info.LicenseKey = $licProps32.licenseId }
+        }
+    }
+
     if ($avpPath) {
         $licFound = $false
         foreach ($root in @("HKLM:\SOFTWARE\KasperskyLab", "HKLM:\SOFTWARE\WOW6432Node\KasperskyLab")) {
@@ -335,9 +419,42 @@ function Get-KasperskyInfo {
         }
         try {
             $licOut = & $avpPath license 2>&1 | Out-String
-            if ($licOut -match "(?i)expired") { $info.LicenseStatus = "EXPIRED" }
-            elseif ($licOut -match "(?i)active|valid") { $info.LicenseStatus = "ACTIVE / VALID" }
-            elseif ($licFound) { $info.LicenseStatus = "INSTALLED" }
+            # Extract license key — try multiple patterns
+            $keyMatch = [regex]::Match($licOut, "(?i)(?:key|license\s+key|activation\s+key)\s*[:=]\s*([A-Z0-9]{5}(?:-[A-Z0-9]{5}){3})")
+            if (-not $keyMatch.Success) { $keyMatch = [regex]::Match($licOut, "([A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5})") }
+            if (-not $keyMatch.Success) { $keyMatch = [regex]::Match($licOut, "(?i)key\s*[:=]\s*(\S+)") }
+            if ($keyMatch.Success) { $info.LicenseKey = $keyMatch.Groups[$keyMatch.Groups.Count - 1].Value.Trim() }
+            # Extract license name/type
+            $nameMatch = [regex]::Match($licOut, "(?i)(?:license|product|edition)\s*(?:name|type)?\s*[:=]\s*(.+)")
+            if ($nameMatch.Success) { $info.LicenseName = $nameMatch.Groups[1].Value.Trim() }
+            # Extract activation date
+            $actMatch = [regex]::Match($licOut, "(?i)(?:activation\s+date|activated)\s*[:=]\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})")
+            if ($actMatch.Success) { $info.LicenseActivationDate = $actMatch.Groups[1].Value.Trim() }
+            # Extract subscription status
+            if ($licOut -match "(?i)subscription\s+is\s+active") { $info.LicenseSubscriptionStatus = "Subscription is active" }
+            elseif ($licOut -match "(?i)subscription\s+is\s+expired") { $info.LicenseSubscriptionStatus = "Subscription is expired" }
+            elseif ($licOut -match "(?i)expiration\s+date\s+is\s+not\s+set") { $info.LicenseSubscriptionStatus = "Expiration date is not set" }
+            # Extract expiration date — try multiple patterns
+            $expMatch = [regex]::Match($licOut, "(?i)(?:expiration|expires|valid\s+until|end\s+date)\s*(?:date)?\s*[:=]\s*(\d{4}-\d{2}-\d{2})")
+            if (-not $expMatch.Success) { $expMatch = [regex]::Match($licOut, "(?i)(?:expiration|expires)\s*[:=]\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})") }
+            if ($expMatch.Success) {
+                $expDateStr = $expMatch.Groups[1].Value
+                $parsedDate = $null
+                if ([DateTime]::TryParse($expDateStr, [ref]$parsedDate)) {
+                    $info.LicenseExpiration = $parsedDate.ToString("yyyy-MM-dd")
+                    $daysLeft = ($parsedDate - (Get-Date)).Days
+                    if ($daysLeft -lt 0) {
+                        $info.LicenseDaysRemaining = "EXPIRED"
+                        $info.LicenseStatus = "EXPIRED"
+                    } else {
+                        $info.LicenseDaysRemaining = "$daysLeft days remaining"
+                        $info.LicenseStatus = "ACTIVE"
+                    }
+                }
+            }
+            if ($info.LicenseStatus -ne "EXPIRED" -and $licOut -match "(?i)expired") { $info.LicenseStatus = "EXPIRED" }
+            elseif ($info.LicenseStatus -ne "EXPIRED" -and $licOut -match "(?i)active|valid") { $info.LicenseStatus = "ACTIVE" }
+            elseif ($info.LicenseStatus -eq "NOT AVAILABLE LOCALLY" -and $licFound) { $info.LicenseStatus = "INSTALLED" }
         } catch {
             if ($licFound) { $info.LicenseStatus = "INSTALLED" }
         }
@@ -569,14 +686,14 @@ function Generate-DevicePage {
             </div>
             <div class="card-body">
                 $(if ($Data.WiFi.Count -gt 0) {
-                    $wifiMACs = ($Data.WiFi | ForEach-Object { $_.MAC }) -join ' | '
+                    $wifiMACboxes = ($Data.WiFi | ForEach-Object { "<div class='mac-box'><span class='mac-addr'>$($_.MAC)</span><button class='mac-copy' onclick='copyMAC(this)'>Copy</button></div>" }) -join ''
                     $wifiInfo = ($Data.WiFi | ForEach-Object { "$($_.Name) ($($_.Status)) - $($_.IPv4) GW: $($_.Gateway)" }) -join '<br>'
-                    "<h4>Wi-Fi</h4><div class='mac-line'>MAC: <strong>$wifiMACs</strong></div><div class='info-grid'><div class='info-item' style='grid-column: 1/-1'><span class='label'>Adapter</span><span class='value'>$wifiInfo</span></div></div>"
+                    "<h4>Wi-Fi</h4><div class='mac-container'>$wifiMACboxes</div><div class='info-grid'><div class='info-item' style='grid-column: 1/-1'><span class='label'>Adapter</span><span class='value'>$wifiInfo</span></div></div>"
                 } else { "<p class='no-data'>No Wi-Fi adapter detected</p>" })
                 $(if ($Data.LAN.Count -gt 0) {
-                    $lanMACs = ($Data.LAN | ForEach-Object { $_.MAC }) -join ' | '
+                    $lanMACboxes = ($Data.LAN | ForEach-Object { "<div class='mac-box'><span class='mac-addr'>$($_.MAC)</span><button class='mac-copy' onclick='copyMAC(this)'>Copy</button></div>" }) -join ''
                     $lanInfo = ($Data.LAN | ForEach-Object { "$($_.Name) ($($_.Status)) - $($_.IPv4) GW: $($_.Gateway)" }) -join '<br>'
-                    "<h4>Ethernet / LAN</h4><div class='mac-line'>MAC: <strong>$lanMACs</strong></div><div class='info-grid'><div class='info-item' style='grid-column: 1/-1'><span class='label'>Adapter</span><span class='value'>$lanInfo</span></div></div>"
+                    "<h4>Ethernet / LAN</h4><div class='mac-container'>$lanMACboxes</div><div class='info-grid'><div class='info-item' style='grid-column: 1/-1'><span class='label'>Adapter</span><span class='value'>$lanInfo</span></div></div>"
                 } else { "<p class='no-data'>No Ethernet adapter detected</p>" })
             </div>
         </div>
@@ -685,7 +802,8 @@ function Generate-KasperskyPage {
                     <div class="info-item"><span class="label">KES Version</span><span class="value">$($Data.KESVersion)</span></div>
                     <div class="info-item"><span class="label">Version Source</span><span class="value">$($Data.KESVersionSource)</span></div>
                     <div class="info-item"><span class="label">Service Name</span><span class="value">$(if ($Data.KESService) { $Data.KESService.Name } else { 'N/A' })</span></div>
-                    <div class="info-item"><span class="label">AVP Path</span><span class="value small">$($Data.AvpPath)</span></div>
+                    <div class="info-item" style="grid-column: 1/-1"><span class="label">AVP Path</span><span class="value small">$($Data.AvpPath)</span></div>
+                    $(if ($Data.KESInstallVersion) { "<div class='info-item' style='grid-column: 1/-1'><span class='label'>KES App Version</span><span class='value'>$($Data.KESInstallVersion)</span></div>" })
                 </div>
             </div>
         </div>
@@ -707,6 +825,32 @@ function Generate-KasperskyPage {
             </div>
         </div>
 
+        <!-- License Card -->
+        <div class="license-card" style="grid-column: 1/-1;">
+            <div class="license-header">
+                <div class="license-title">$(if ($Data.LicenseName) { $Data.LicenseName } else { 'Kaspersky Endpoint Security' })</div>
+                <div class="license-doc-icon">&#128196;</div>
+            </div>
+            <div class="license-section">Current License</div>
+            <div class="license-divider"></div>
+            <div class="license-subtitle">Subscription for updates</div>
+            <div class="license-detail">Protection, Security Controls, Data Encryption, Endpoint Detection and Response</div>
+            <div class="license-divider"></div>
+            $(if ($Data.LicenseActivationDate) { "<div class='license-detail'><strong>Activation date:</strong> $($Data.LicenseActivationDate)</div>" })
+            $(if ($Data.LicenseSubscriptionStatus) { "<div class='license-detail'>$($Data.LicenseSubscriptionStatus)</div>" })
+            $(if ($Data.LicenseExpiration) { "<div class='license-detail'><strong>Expiration date:</strong> $($Data.LicenseExpiration)</div>" })
+            <div class="license-divider"></div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 8px;">
+                $(if ($Data.LicenseDaysRemaining) { "<span class='$(if ($Data.LicenseStatus -eq 'EXPIRED') { 'license-status-expired' } else { 'license-status-active' })'>$($Data.LicenseDaysRemaining)</span>" } else { "<span class='license-status-active'>$(if ($Data.LicenseStatus) { $Data.LicenseStatus } else { 'Checking...' })</span>" })
+                <span style='text-align: right;'>
+                    <span style='font-size: 11px; color: #8b949e; display: block;'>License Key</span>
+                    <span class='license-key-display'>$(if ($Data.LicenseKey) { $Data.LicenseKey } else { 'Not found' })</span>
+                    <span style='font-size: 11px; color: #8b949e; display: block; margin-top: 8px;'>License ID</span>
+                    <span class='license-key-display'>$(if ($Data.LicenseKey) { $Data.LicenseKey } else { 'Not found' })</span>
+                </span>
+            </div>
+        </div>
+
         <!-- KSC Connection Card -->
         <div class="card">
             <div class="card-header">
@@ -715,20 +859,11 @@ function Generate-KasperskyPage {
                 <span class="status-badge" style="background: $(Get-StatusColor $Data.KSCConnection)">$($Data.KSCConnection)</span>
             </div>
             <div class="card-body">
-                <div class="info-grid">
-                    <div class="info-item"><span class="label">Administration Server</span><span class="value">$($Data.AdminServer)</span></div>
-                    <div class="info-item"><span class="label">Last Synchronization</span><span class="value">$($Data.LastSync)</span></div>
-                    $(if ($Data.TimeSinceConnection) { "<div class='info-item'><span class='label'>Time Since Connection</span><span class='value'>$($Data.TimeSinceConnection)</span></div>" })
+                <div class="ksc-grid">
+                    $(if ($Data.ManagedBy) { "<div class='ksc-item'><span class='ksc-label'>Managed by:</span><span class='ksc-value'>$($Data.ManagedBy)</span></div>" })
+                    $(if ($Data.TimeSinceConnection) { "<div class='ksc-item'><span class='ksc-label'>Server connected:</span><span class='ksc-value'>$($Data.TimeSinceConnection)</span></div>" })
+                    $(if ($Data.KESVersion) { "<div class='ksc-item'><span class='ksc-label'>Version:</span><span class='ksc-value'>$($Data.KESVersion)</span></div>" })
                 </div>
-            </div>
-        </div>
-
-        <!-- License Card -->
-        <div class="card">
-            <div class="card-header">
-                <span class="card-icon">&#128273;</span>
-                <h3>License</h3>
-                <span class="status-badge" style="background: $(Get-StatusColor $Data.LicenseStatus)">$($Data.LicenseStatus)</span>
             </div>
         </div>
 
@@ -1199,6 +1334,163 @@ function Generate-FullHtml {
             letter-spacing: 0.5px;
         }
 
+        .mac-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+
+        .mac-box {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 12px 16px;
+            background: #0d1117;
+            border: 1px solid #21262d;
+            border-radius: 8px;
+            min-width: 220px;
+        }
+
+        .mac-box .mac-addr {
+            font-size: 15px;
+            color: #58a6ff;
+            font-weight: 600;
+            font-family: 'Consolas', 'Monaco', monospace;
+            letter-spacing: 0.5px;
+        }
+
+        .mac-copy {
+            padding: 4px 12px;
+            font-size: 11px;
+            color: #58a6ff;
+            background: transparent;
+            border: 1px solid #58a6ff;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .mac-copy:hover {
+            background: #58a6ff;
+            color: #0d1117;
+        }
+
+        .ksc-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .ksc-item {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .ksc-label {
+            font-size: 13px;
+            color: #8b949e;
+        }
+
+        .ksc-value {
+            font-size: 15px;
+            color: #f0f6fc;
+            font-weight: 700;
+        }
+
+        .license-card {
+            background: linear-gradient(135deg, #1a3a2a 0%, #0d2818 100%);
+            border: 1px solid #2ea043;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 16px;
+        }
+
+        .license-card .license-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 16px;
+        }
+
+        .license-card .license-title {
+            font-size: 20px;
+            font-weight: 700;
+            color: #f0f6fc;
+        }
+
+        .license-card .license-doc-icon {
+            font-size: 28px;
+            color: #8b949e;
+        }
+
+        .license-card .license-section {
+            font-size: 12px;
+            color: #8b949e;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 4px;
+        }
+
+        .license-card .license-divider {
+            height: 1px;
+            background: rgba(255,255,255,0.1);
+            margin: 12px 0;
+        }
+
+        .license-card .license-subtitle {
+            font-size: 16px;
+            font-weight: 600;
+            color: #f0f6fc;
+            margin-bottom: 8px;
+        }
+
+        .license-card .license-detail {
+            font-size: 13px;
+            color: #8b949e;
+            margin-bottom: 4px;
+        }
+
+        .license-card .license-key-display {
+            display: inline-block;
+            font-size: 16px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            color: #58a6ff;
+            font-weight: 600;
+            padding: 8px 16px;
+            border: 2px solid #58a6ff;
+            border-radius: 8px;
+            background: rgba(88, 166, 255, 0.1);
+        }
+
+        .license-card .license-status-active {
+            display: inline-block;
+            padding: 4px 12px;
+            background: #2ea043;
+            color: #fff;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .license-card .license-status-expired {
+            display: inline-block;
+            padding: 4px 12px;
+            background: #ff1744;
+            color: #fff;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        @media (max-width: 768px) {
+            .ksc-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
         h4 {
             font-size: 13px;
             color: #8b949e;
@@ -1257,6 +1549,13 @@ function Generate-FullHtml {
     </div>
 
     <script>
+        function copyMAC(btn) {
+            var macText = btn.parentElement.querySelector('.mac-addr').textContent;
+            navigator.clipboard.writeText(macText).then(function() {
+                btn.textContent = 'Copied!';
+                setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
+            });
+        }
         function showPage(pageName, tabElement) {
             // Hide all pages
             document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
